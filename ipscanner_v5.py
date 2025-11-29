@@ -397,9 +397,11 @@ def fetch_country_mapping():
     """
     url = 'https://api.first.org/data/v1/countries?limit=300'
     try:
-        response = requests.get(url, timeout=10)
+        response = requests.get(url, timeout=10) #requests.get is used to send a GET request to the URL.
+                                                 #(requests is a library that allows you to send HTTP requests using Python)
+                                                 #timeout=10 is used to set the timeout for the request to 10 seconds.
         if response.status_code == 200:
-            data = response.json()
+            data = response.json() #response.json() is used to parse the JSON response into a Python dictionary.
             mapping = {}
             for code, details in data.get("data", {}).items():
                 mapping[code] = details.get("country")
@@ -431,11 +433,13 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)   # Handle Ctrl+C
     signal.signal(signal.SIGTERM, signal_handler)  # Handle termination signal
     
-    # Reset stop event (in case the script is run multiple times in the same process)
+    # Reset stop event 
+    # (in case the script is stopped and started again 
+    # then we need to clear the stop event and reset the event to false so that the scanner can start again)
     stop_event.clear()
     
     # Log application startup
-    start_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    start_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S") #Converts datetime to formatted readable string using strftime function
     print(f"\n[{start_time}] IOC Scanner application starting...")
     logger.info("IOC Scanner application starting")
     
