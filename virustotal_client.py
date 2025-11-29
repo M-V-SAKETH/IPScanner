@@ -5,6 +5,8 @@ Handles all interactions with VirusTotal API with proper quota tracking
 
 import requests
 import time
+import json
+import os
 from datetime import datetime, timezone, date
 from collections import defaultdict
 from loggerConfig import logger
@@ -12,7 +14,7 @@ from config import (
     API_KEYS, RATE_LIMIT_DELAY, API_TIMEOUT, 
     API_REQUEST_DELAY, MAX_RETRIES, RETRY_DELAY,
     MAX_REQUESTS_PER_MINUTE, MAX_REQUESTS_PER_DAY,
-    MIN_DELAY_BETWEEN_REQUESTS, QUOTA_WARNING_THRESHOLD
+    MIN_DELAY_BETWEEN_REQUESTS, QUOTA_WARNING_THRESHOLD, QUOTA_FILE
 )
 
 
@@ -31,6 +33,12 @@ class VirusTotalClient:
         
         # Track last request time per key to enforce minimum delay
         self.last_request_time = defaultdict(float)
+        
+        # Quota file path for persistence
+        self.quota_file = QUOTA_FILE
+        
+        # Load persisted quota data on startup
+        self._load_quota_data()
         
         # API endpoint mapping
         self.api_type_map = {
@@ -59,12 +67,53 @@ class VirusTotalClient:
         today = date.today().isoformat()
         return self.daily_quota[key_index].get(today, 0)
     
-    def _increment_daily_count(self, key_index):
+    def _increment_daily_count(self, key_index, save=True):
         """Increment the daily request count for a given key"""
         today = date.today().isoformat()
         if today not in self.daily_quota[key_index]:
             self.daily_quota[key_index][today] = 0
         self.daily_quota[key_index][today] += 1
+        
+        # Save quota data after each increment
+        if save:
+            self._save_quota_data()
+    
+    def _load_quota_data(self):
+        """Load quota tracking data from JSON file"""
+        if os.path.exists(self.quota_file):
+            try:
+                with open(self.quota_file, 'r') as f:
+                    data = json.load(f)
+                    # Convert date strings back to dict structure
+                    if 'daily_quota' in data:
+                        for key_index_str, dates_dict in data['daily_quota'].items():
+                            key_index = int(key_index_str)
+                            self.daily_quota[key_index] = dates_dict
+                logger.info(f"Loaded quota data from {self.quota_file}")
+                
+                # Print quota status for debugging
+                self.print_quota_status()
+            except Exception as e:
+                logger.error(f"Error loading quota data: {e}")
+                # Continue with empty quota tracking
+        else:
+            logger.info(f"Quota file {self.quota_file} not found. Starting with fresh tracking.")
+    
+    def _save_quota_data(self):
+        """Save quota tracking data to JSON file"""
+        try:
+            # Convert to JSON-serializable format
+            data = {
+                'daily_quota': {
+                    str(key_index): dates_dict
+                    for key_index, dates_dict in self.daily_quota.items()
+                },
+                'last_updated': datetime.now().isoformat()
+            }
+            with open(self.quota_file, 'w') as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            logger.error(f"Error saving quota data: {e}")
     
     def _is_key_available(self, key_index):
         """Check if a key is available (not rate limited and has quota)"""
@@ -230,36 +279,38 @@ class VirusTotalClient:
                 logger.info(f"Checking {ioc_type.upper()}: {ioc} (using key {key_index}, daily: {daily_count}/{MAX_REQUESTS_PER_DAY})")
                 response = requests.get(url, headers=headers, timeout=API_TIMEOUT)
                 
-                # Track the request
-                current_time = time.time()
-                self.requests_per_minute[key_index].append(current_time)
-                self.last_request_time[key_index] = current_time
-                self._increment_daily_count(key_index)
-                
                 logger.info(f"API Response Status: {response.status_code}")
 
-                # Handle rate limiting (shouldn't happen often with proper tracking)
+                # Handle rate limiting - DON'T count toward quota
                 if response.status_code == 429:
-                    logger.warning(f"Unexpected 429 for key {key_index}. Cleaning up and retrying...")
-                    # Clean up and try next key
+                    logger.warning(f"Rate limit 429 for key {key_index}. Not counting toward quota. Switching to next key...")
+                    # Clean up and try next key - DON'T increment quota for failed requests
                     self.requests_per_minute[key_index] = []  # Reset
                     self.api_index = (self.api_index + 1) % len(API_KEYS)
                     self.start_index = self.api_index
                     time.sleep(MIN_DELAY_BETWEEN_REQUESTS)
                     continue
 
-                # Handle blocked API keys
+                # Handle blocked API keys - DON'T count toward quota
                 if response.status_code in [400, 403, 500]:
                     if response.status_code == 403:
-                        print(f"API key {key_index} might be blocked (Status: {response.status_code}). Switching to next API key...")
-                        logger.warning(f"API key {key_index} might be blocked. Status: {response.status_code}. Switching API key.")
+                        print(f"API key {key_index} might be blocked (Status: {response.status_code}). Not counting toward quota. Switching to next API key...")
+                        logger.warning(f"API key {key_index} might be blocked. Status: {response.status_code}. Not counting toward quota. Switching API key.")
                         self.api_index = (self.api_index + 1) % len(API_KEYS)
                         self.start_index = self.api_index
                         continue
-                    # For 400 and 500, return to allow retry logic
+                    # For 400 and 500, return to allow retry logic - DON'T count toward quota
                     return response.status_code, None
 
-                # Handle not found case
+                # Only track successful requests (200, 404) toward quota
+                if response.status_code in [200, 404]:
+                    # Track the request only on success
+                    current_time = time.time()
+                    self.requests_per_minute[key_index].append(current_time)
+                    self.last_request_time[key_index] = current_time
+                    self._increment_daily_count(key_index, save=True)  # Only increment on success
+
+                # Handle not found case (successful response)
                 if response.status_code == 404:
                     logger.info(f"IOC not found in VirusTotal: {ioc}")
                     return 404, {
@@ -409,6 +460,28 @@ class VirusTotalClient:
                 'per_minute_remaining': MAX_REQUESTS_PER_MINUTE - per_minute_count
             }
         return status
+    
+    def print_quota_status(self):
+        """Print current quota status for all keys"""
+        today = date.today().isoformat()
+        print("\n" + "=" * 50)
+        print("API Key Quota Status (Today: " + today + ")")
+        print("=" * 50)
+        total_used = 0
+        total_remaining = 0
+        for i in range(len(API_KEYS)):
+            daily_count = self.daily_quota[i].get(today, 0)
+            remaining = MAX_REQUESTS_PER_DAY - daily_count
+            percentage = (daily_count / MAX_REQUESTS_PER_DAY * 100) if MAX_REQUESTS_PER_DAY > 0 else 0
+            status_symbol = "✓" if remaining > 0 else "✗"
+            print(f"{status_symbol} Key {i}: {daily_count:3d}/{MAX_REQUESTS_PER_DAY} used ({remaining:3d} remaining) [{percentage:5.1f}%]")
+            total_used += daily_count
+            total_remaining += remaining
+        
+        print("-" * 50)
+        print(f"Total: {total_used:3d}/{len(API_KEYS) * MAX_REQUESTS_PER_DAY} used ({total_remaining:3d} remaining)")
+        print("=" * 50 + "\n")
+        logger.info(f"Quota status - Total used: {total_used}/{len(API_KEYS) * MAX_REQUESTS_PER_DAY}, Remaining: {total_remaining}")
 
 
 def fetch_country_mapping():

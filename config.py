@@ -41,3 +41,6 @@ FORCE_SAVE_INTERVAL = 50  # Force save every N IOCs regardless
 COUNTRY_API_URL = 'https://api.first.org/data/v1/countries?limit=300'
 COUNTRY_API_TIMEOUT = 10
 
+# Quota Tracking Configuration
+QUOTA_FILE = "api_quota_tracking.json"  # File to persist quota tracking data
+
