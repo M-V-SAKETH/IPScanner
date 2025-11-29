@@ -1,25 +1,36 @@
 """
 VirusTotal API Client Module
-Handles all interactions with VirusTotal API
+Handles all interactions with VirusTotal API with proper quota tracking
 """
 
 import requests
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
+from collections import defaultdict
 from loggerConfig import logger
 from config import (
     API_KEYS, RATE_LIMIT_DELAY, API_TIMEOUT, 
-    API_REQUEST_DELAY, MAX_RETRIES, RETRY_DELAY
+    API_REQUEST_DELAY, MAX_RETRIES, RETRY_DELAY,
+    MAX_REQUESTS_PER_MINUTE, MAX_REQUESTS_PER_DAY,
+    MIN_DELAY_BETWEEN_REQUESTS, QUOTA_WARNING_THRESHOLD
 )
-# stop_event will be passed as parameter to avoid circular import
 
 
 class VirusTotalClient:
-    """Client for interacting with VirusTotal API"""
+    """Client for interacting with VirusTotal API with quota management"""
     
     def __init__(self):
         self.api_index = 0
-        self.api_request_count = 0
+        self.start_index = 0  # Track where we started to detect full cycle
+        
+        # Per-minute tracking: {key_index: [list of timestamps]}
+        self.requests_per_minute = defaultdict(list)
+        
+        # Daily quota tracking: {key_index: {date: count}}
+        self.daily_quota = defaultdict(dict)
+        
+        # Track last request time per key to enforce minimum delay
+        self.last_request_time = defaultdict(float)
         
         # API endpoint mapping
         self.api_type_map = {
@@ -35,17 +46,116 @@ class VirusTotalClient:
             "file": "file"
         }
     
+    def _cleanup_old_requests(self, key_index):
+        """Remove request timestamps older than 1 minute"""
+        current_time = time.time()
+        self.requests_per_minute[key_index] = [
+            ts for ts in self.requests_per_minute[key_index]
+            if current_time - ts < 60
+        ]
+    
+    def _get_daily_count(self, key_index):
+        """Get the number of requests made today for a given key"""
+        today = date.today().isoformat()
+        return self.daily_quota[key_index].get(today, 0)
+    
+    def _increment_daily_count(self, key_index):
+        """Increment the daily request count for a given key"""
+        today = date.today().isoformat()
+        if today not in self.daily_quota[key_index]:
+            self.daily_quota[key_index][today] = 0
+        self.daily_quota[key_index][today] += 1
+    
+    def _is_key_available(self, key_index):
+        """Check if a key is available (not rate limited and has quota)"""
+        # Clean up old requests first
+        self._cleanup_old_requests(key_index)
+        
+        # Check daily quota
+        daily_count = self._get_daily_count(key_index)
+        if daily_count >= MAX_REQUESTS_PER_DAY:
+            return False, f"Daily quota exhausted ({daily_count}/{MAX_REQUESTS_PER_DAY})"
+        
+        # Check per-minute rate limit
+        requests_in_last_minute = len(self.requests_per_minute[key_index])
+        if requests_in_last_minute >= MAX_REQUESTS_PER_MINUTE:
+            # Calculate wait time needed
+            oldest_request = min(self.requests_per_minute[key_index])
+            wait_time = 60 - (time.time() - oldest_request) + 1
+            return False, f"Rate limit reached ({requests_in_last_minute}/{MAX_REQUESTS_PER_MINUTE} per minute), wait {wait_time:.1f}s"
+        
+        return True, "Available"
+    
+    def _find_available_key(self, stop_event=None):
+        """Find an available API key, waiting if necessary"""
+        max_wait_iterations = len(API_KEYS) * 10  # Prevent infinite loops
+        iterations = 0
+        
+        while iterations < max_wait_iterations:
+            if stop_event and stop_event.is_set():
+                return None, "Scanner stopped"
+            
+            # Check current key
+            is_available, reason = self._is_key_available(self.api_index)
+            if is_available:
+                return self.api_index, "Available"
+            
+            # Try next key
+            self.api_index = (self.api_index + 1) % len(API_KEYS)
+            iterations += 1
+            
+            # If we've cycled through all keys, wait a bit and try again
+            if self.api_index == self.start_index and iterations > 0:
+                wait_time = min(10, MIN_DELAY_BETWEEN_REQUESTS)
+                if stop_event and stop_event.is_set():
+                    return None, "Scanner stopped"
+                logger.info(f"All keys checked, waiting {wait_time}s before retry...")
+                time.sleep(wait_time)
+                self.start_index = self.api_index  # Reset start tracking
+        
+        return None, "All keys exhausted after multiple attempts"
+    
+    def _wait_for_rate_limit(self, key_index, stop_event=None):
+        """Wait until the key is available for the next request"""
+        # Clean up old requests
+        self._cleanup_old_requests(key_index)
+        
+        requests_in_last_minute = len(self.requests_per_minute[key_index])
+        
+        if requests_in_last_minute >= MAX_REQUESTS_PER_MINUTE:
+            # Need to wait until the oldest request is 60 seconds old
+            oldest_request = min(self.requests_per_minute[key_index])
+            wait_time = 60 - (time.time() - oldest_request) + 1
+            
+            if wait_time > 0:
+                logger.info(f"Key {key_index}: Rate limit reached. Waiting {wait_time:.1f} seconds...")
+                elapsed = 0
+                while elapsed < wait_time:
+                    if stop_event and stop_event.is_set():
+                        return False
+                    sleep_chunk = min(1, wait_time - elapsed)
+                    time.sleep(sleep_chunk)
+                    elapsed += sleep_chunk
+        else:
+            # Ensure minimum delay between requests
+            time_since_last = time.time() - self.last_request_time[key_index]
+            if time_since_last < MIN_DELAY_BETWEEN_REQUESTS:
+                wait_time = MIN_DELAY_BETWEEN_REQUESTS - time_since_last
+                time.sleep(wait_time)
+        
+        return True
+    
     def get_next_api_key(self):
-        """Switch to the next available API key"""
+        """Switch to the next available API key (legacy method, use _find_available_key instead)"""
         self.api_index = (self.api_index + 1) % len(API_KEYS)
-        self.api_request_count = 0
+        self.start_index = self.api_index
         print(f"Switching to next API key: {self.api_index}")
         logger.info(f"Switching to next API key: {self.api_index}")
         return API_KEYS[self.api_index]
     
     def check_ioc(self, ioc, ioc_type, country_mapping=None, stop_event=None):
         """
-        Check an IOC against VirusTotal API with retry logic
+        Check an IOC against VirusTotal API with retry logic and quota management
         
         Args:
             ioc: The IOC to check
@@ -83,12 +193,33 @@ class VirusTotalClient:
         return status_code, result
     
     def _make_api_request(self, ioc, ioc_type, api_path, gui_path, country_mapping, stop_event=None):
-        """Make a single API request to VirusTotal"""
+        """Make a single API request to VirusTotal with proper quota management"""
         while True:
             if stop_event and stop_event.is_set():
                 return 0, None
             
-            api_key = API_KEYS[self.api_index]
+            # Find an available key
+            key_index, reason = self._find_available_key(stop_event)
+            if key_index is None:
+                if reason == "Scanner stopped":
+                    return 0, None
+                logger.error(f"Could not find available API key: {reason}")
+                return 429, None
+            
+            # Update current index
+            self.api_index = key_index
+            
+            # Wait for rate limit if needed
+            if not self._wait_for_rate_limit(key_index, stop_event):
+                return 0, None  # Scanner stopped
+            
+            # Check daily quota warning
+            daily_count = self._get_daily_count(key_index)
+            if daily_count >= MAX_REQUESTS_PER_DAY * QUOTA_WARNING_THRESHOLD:
+                logger.warning(f"API key {key_index} has used {daily_count}/{MAX_REQUESTS_PER_DAY} requests today ({daily_count/MAX_REQUESTS_PER_DAY*100:.1f}%)")
+            
+            # Make the request
+            api_key = API_KEYS[key_index]
             url = f'https://www.virustotal.com/api/v3/{api_path}/{ioc}'
             headers = {
                 "accept": "application/json",
@@ -96,29 +227,34 @@ class VirusTotalClient:
             }
         
             try:
-                logger.info(f"Checking {ioc_type.upper()}: {ioc}")
+                logger.info(f"Checking {ioc_type.upper()}: {ioc} (using key {key_index}, daily: {daily_count}/{MAX_REQUESTS_PER_DAY})")
                 response = requests.get(url, headers=headers, timeout=API_TIMEOUT)
-                self.api_request_count += 1
+                
+                # Track the request
+                current_time = time.time()
+                self.requests_per_minute[key_index].append(current_time)
+                self.last_request_time[key_index] = current_time
+                self._increment_daily_count(key_index)
                 
                 logger.info(f"API Response Status: {response.status_code}")
 
-                # Handle rate limiting
+                # Handle rate limiting (shouldn't happen often with proper tracking)
                 if response.status_code == 429:
-                    print(f"Rate limit exceeded for API key {self.api_index}. Switching to next API key...")
-                    logger.warning(f"Rate limit exceeded for API key {self.api_index}. Switching API key.")
-                    api_key = self.get_next_api_key()
-                    if self.api_index == 0:  
-                        print(f"All API keys have reached their rate limit. Waiting for {RATE_LIMIT_DELAY} seconds...")
-                        logger.warning(f"All API keys reached rate limit. Waiting {RATE_LIMIT_DELAY} sec.")
-                        time.sleep(RATE_LIMIT_DELAY)
+                    logger.warning(f"Unexpected 429 for key {key_index}. Cleaning up and retrying...")
+                    # Clean up and try next key
+                    self.requests_per_minute[key_index] = []  # Reset
+                    self.api_index = (self.api_index + 1) % len(API_KEYS)
+                    self.start_index = self.api_index
+                    time.sleep(MIN_DELAY_BETWEEN_REQUESTS)
                     continue
 
                 # Handle blocked API keys
                 if response.status_code in [400, 403, 500]:
                     if response.status_code == 403:
-                        print(f"API key {self.api_index} might be blocked (Status: {response.status_code}). Switching to next API key...")
-                        logger.warning(f"API key {self.api_index} might be blocked. Status: {response.status_code}. Switching API key.")
-                        api_key = self.get_next_api_key()
+                        print(f"API key {key_index} might be blocked (Status: {response.status_code}). Switching to next API key...")
+                        logger.warning(f"API key {key_index} might be blocked. Status: {response.status_code}. Switching API key.")
+                        self.api_index = (self.api_index + 1) % len(API_KEYS)
+                        self.start_index = self.api_index
                         continue
                     # For 400 and 500, return to allow retry logic
                     return response.status_code, None
@@ -251,8 +387,28 @@ class VirusTotalClient:
     
     def apply_rate_limit(self, stop_event=None):
         """Apply rate limiting delay between requests"""
-        if stop_event is None or not stop_event.is_set():
-            time.sleep(API_REQUEST_DELAY)
+        # The rate limiting is now handled automatically in _wait_for_rate_limit
+        # This method is kept for backward compatibility but does minimal work
+        if stop_event and stop_event.is_set():
+            return
+        # Small delay to prevent CPU spinning
+        time.sleep(0.1)
+    
+    def get_quota_status(self):
+        """Get status of all API keys' quotas"""
+        today = date.today().isoformat()
+        status = {}
+        for i in range(len(API_KEYS)):
+            daily_count = self.daily_quota[i].get(today, 0)
+            self._cleanup_old_requests(i)
+            per_minute_count = len(self.requests_per_minute[i])
+            status[i] = {
+                'daily_used': daily_count,
+                'daily_remaining': MAX_REQUESTS_PER_DAY - daily_count,
+                'per_minute_count': per_minute_count,
+                'per_minute_remaining': MAX_REQUESTS_PER_MINUTE - per_minute_count
+            }
+        return status
 
 
 def fetch_country_mapping():
@@ -280,4 +436,3 @@ def fetch_country_mapping():
         print("Error fetching country mapping:", e)
         logger.error(f"Error fetching country mapping: {e}")
         return {}
-

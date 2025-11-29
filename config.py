@@ -23,6 +23,12 @@ API_REQUEST_DELAY = 1  # Delay between API requests in seconds
 MAX_RETRIES = 3  # Maximum number of retries for failed API requests
 RETRY_DELAY = 5  # Delay between retries in seconds
 
+# VirusTotal Rate Limits (Free Tier)
+MAX_REQUESTS_PER_MINUTE = 4  # Per API key - maximum requests per minute
+MAX_REQUESTS_PER_DAY = 500   # Per API key - maximum requests per day
+MIN_DELAY_BETWEEN_REQUESTS = 15  # Seconds (60/4 = 15 to stay under 4/min per key)
+QUOTA_WARNING_THRESHOLD = 0.9  # Warn when 90% of daily quota is used
+
 # File Configuration
 INPUT_FILE = "ioc_input.csv"
 CSV_ENCODING = "windows-1252"

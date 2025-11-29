@@ -171,8 +171,7 @@ def scan_iocs(df, start_index, country_mapping=None):
             if csv_handler.should_save(force=False):
                 csv_handler.save_csv(df, force=False)
             
-            # Apply rate limiting
-            vt_client.apply_rate_limit(stop_event)
+            # Rate limiting is now handled automatically in VirusTotalClient
     
     except Exception as e:
         # Log any unexpected error that causes the scanner to stop
