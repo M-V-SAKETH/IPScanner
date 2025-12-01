@@ -162,8 +162,25 @@ def scan_iocs(df, start_index, country_mapping=None):
                 print(f"\n{index+1}. IOC {ioc} ({ioc_type.upper()}): Not found in VirusTotal\n")
                 logger.info(f"IOC {ioc} ({ioc_type.upper()}): Not found in VirusTotal")
             else:
-                print(f"Failed to process IOC {ioc}. Status code: {status_code}")
-                logger.warning(f"Failed to process IOC {ioc}. Status code: {status_code}")
+                # Detailed logging for failures to avoid silent breaks
+                if status_code in [408]:
+                    msg = f"Timeout while processing IOC {ioc} (HTTP {status_code}). Will be treated as failed after retries."
+                    print(msg)
+                    logger.warning(msg)
+                elif status_code in [499]:
+                    msg = f"Network error while processing IOC {ioc} (synthetic status {status_code})."
+                    print(msg)
+                    logger.warning(msg)
+                elif status_code in [400, 403, 429, 500]:
+                    msg = (
+                        f"VirusTotal API error for IOC {ioc}. "
+                        f"Final status code after retries: {status_code}"
+                    )
+                    print(msg)
+                    logger.warning(msg)
+                else:
+                    print(f"Failed to process IOC {ioc}. Status code: {status_code}")
+                    logger.warning(f"Failed to process IOC {ioc}. Status code: {status_code}")
                 
             processed_ips += 1
             
@@ -180,7 +197,7 @@ def scan_iocs(df, start_index, country_mapping=None):
         stop_scanner(error_message)
         logger.error(error_message)
         import traceback
-        logger.error(traceback.format_exc())
+        logger.error("Full stack trace for scanner error:\n" + traceback.format_exc())
         
     finally:
         # Always save progress before exiting

@@ -3,13 +3,24 @@ VirusTotal API Client Module
 Handles all interactions with VirusTotal API
 """
 
-import requests
+import json
+import os
 import time
 from datetime import datetime, timezone
+
+import requests
+
 from loggerConfig import logger
 from config import (
-    API_KEYS, RATE_LIMIT_DELAY, API_TIMEOUT, 
-    API_REQUEST_DELAY, MAX_RETRIES, RETRY_DELAY
+    API_KEYS,
+    RATE_LIMIT_DELAY,
+    API_TIMEOUT,
+    API_REQUEST_DELAY,
+    MAX_RETRIES,
+    RETRY_DELAY,
+    VT_USAGE_FILE,
+    DAILY_QUOTA_PER_KEY,
+    REQUESTS_PER_MINUTE,
 )
 # stop_event will be passed as parameter to avoid circular import
 
@@ -20,6 +31,13 @@ class VirusTotalClient:
     def __init__(self):
         self.api_index = 0
         self.api_request_count = 0
+
+        # Track per-key daily usage loaded from/saved to JSON file
+        self.usage = self._load_usage_state()
+
+        # Track last request timestamps per key to enforce per-minute rate
+        self.last_request_times = [0.0] * len(API_KEYS)
+        self.last_used_key_index = None
         
         # API endpoint mapping
         self.api_type_map = {
@@ -34,14 +52,145 @@ class VirusTotalClient:
             "domain": "domain",
             "file": "file"
         }
-    
+
+    # ------------------------------------------------------------------
+    # Usage / quota tracking helpers
+    # ------------------------------------------------------------------
+
+    def _get_today_str(self):
+        return datetime.utcnow().strftime("%Y-%m-%d")
+
+    def _load_usage_state(self):
+        """
+        Load per-key usage information from JSON file.
+        If the file is missing or corrupted, start with a fresh state.
+        """
+        today = self._get_today_str()
+        default_keys = []
+        for _ in API_KEYS:
+            default_keys.append({"last_reset_date": today, "requests_today": 0})
+
+        if not VT_USAGE_FILE:
+            return {"keys": default_keys}
+
+        try:
+            if os.path.exists(VT_USAGE_FILE):
+                with open(VT_USAGE_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            else:
+                data = {"keys": default_keys}
+        except Exception as e:
+            logger.warning(f"Failed to load VT usage file '{VT_USAGE_FILE}': {e}. Recreating state.")
+            data = {"keys": default_keys}
+
+        # Ensure structure and length match API_KEYS
+        keys = data.get("keys", [])
+        if not isinstance(keys, list):
+            keys = []
+
+        # Resize to match number of API keys
+        if len(keys) < len(API_KEYS):
+            for _ in range(len(API_KEYS) - len(keys)):
+                keys.append({"last_reset_date": today, "requests_today": 0})
+        elif len(keys) > len(API_KEYS):
+            keys = keys[: len(API_KEYS)]
+
+        # Normalize entries
+        for i in range(len(keys)):
+            entry = keys[i] or {}
+            last_reset = entry.get("last_reset_date", today)
+            requests_today = entry.get("requests_today", 0)
+            keys[i] = {
+                "last_reset_date": last_reset,
+                "requests_today": int(requests_today) if isinstance(requests_today, (int, float)) else 0,
+            }
+
+        state = {"keys": keys}
+        self._save_usage_state(state)
+        return state
+
+    def _save_usage_state(self, state=None):
+        """Persist usage state to JSON file safely."""
+        if not VT_USAGE_FILE:
+            return
+
+        if state is None:
+            state = self.usage
+
+        try:
+            directory = os.path.dirname(VT_USAGE_FILE)
+            if directory and not os.path.exists(directory):
+                os.makedirs(directory, exist_ok=True)
+
+            with open(VT_USAGE_FILE, "w", encoding="utf-8") as f:
+                json.dump(state, f, indent=2)
+        except Exception as e:
+            logger.warning(f"Failed to save VT usage file '{VT_USAGE_FILE}': {e}")
+
+    def _reset_if_new_day(self, key_index):
+        """Reset the usage counter for a key if a new day has started."""
+        today = self._get_today_str()
+        key_info = self.usage["keys"][key_index]
+        if key_info.get("last_reset_date") != today:
+            key_info["last_reset_date"] = today
+            key_info["requests_today"] = 0
+            self._save_usage_state()
+
+    def _has_quota(self, key_index):
+        """Check if the given key has remaining daily quota."""
+        self._reset_if_new_day(key_index)
+        key_info = self.usage["keys"][key_index]
+        return key_info.get("requests_today", 0) < DAILY_QUOTA_PER_KEY
+
+    def _increment_usage(self, key_index):
+        """Increment the request counter for a key and persist the state."""
+        try:
+            self._reset_if_new_day(key_index)
+            key_info = self.usage["keys"][key_index]
+            key_info["requests_today"] = int(key_info.get("requests_today", 0)) + 1
+            self._save_usage_state()
+        except Exception as e:
+            logger.warning(f"Failed to increment VT usage for key {key_index}: {e}")
+
+    def _select_active_key(self):
+        """
+        Ensure self.api_index points to a key with available daily quota.
+        If all keys are exhausted, wait and retry after RATE_LIMIT_DELAY.
+        """
+        attempts = 0
+        total_keys = len(API_KEYS)
+
+        while True:
+            # Try each key at most once in this pass
+            for offset in range(total_keys):
+                idx = (self.api_index + offset) % total_keys
+                if self._has_quota(idx):
+                    if idx != self.api_index:
+                        logger.info(f"Switching to API key index {idx} due to quota/rotation.")
+                    self.api_index = idx
+                    return API_KEYS[self.api_index]
+
+            # All keys exhausted for today or temporarily blocked
+            attempts += 1
+            logger.warning(
+                f"All VirusTotal API keys appear to be at daily quota. "
+                f"Sleeping for {RATE_LIMIT_DELAY} seconds before retrying (attempt {attempts})."
+            )
+            print(
+                f"All VirusTotal API keys reached daily quota or are blocked. "
+                f"Waiting {RATE_LIMIT_DELAY} seconds before retrying..."
+            )
+            time.sleep(RATE_LIMIT_DELAY)
+
     def get_next_api_key(self):
-        """Switch to the next available API key"""
+        """Switch to the next available API key that still has quota."""
+        # Move to next index then select a key with quota
         self.api_index = (self.api_index + 1) % len(API_KEYS)
         self.api_request_count = 0
+        active_key = self._select_active_key()
         print(f"Switching to next API key: {self.api_index}")
         logger.info(f"Switching to next API key: {self.api_index}")
-        return API_KEYS[self.api_index]
+        return active_key
     
     def check_ioc(self, ioc, ioc_type, country_mapping=None, stop_event=None):
         """
@@ -64,14 +213,17 @@ class VirusTotalClient:
             if stop_event and stop_event.is_set():
                 return 0, None  # Scanner stopped
             
-            status_code, result = self._make_api_request(ioc, ioc_type, api_path, gui_path, country_mapping, stop_event)
+            status_code, result = self._make_api_request(
+                ioc, ioc_type, api_path, gui_path, country_mapping, stop_event
+            )
             
             # If successful or scanner stopped, return immediately
             if status_code in [0, 200, 404]:
                 return status_code, result
             
             # If it's a retryable error and we have retries left, wait and retry
-            if attempt < MAX_RETRIES - 1 and status_code in [400, 500]:
+            # Network/timeout errors (408, 499) and server errors (5xx) are retryable.
+            if attempt < MAX_RETRIES - 1 and status_code in [408, 499, 500]:
                 wait_time = RETRY_DELAY * (attempt + 1)
                 print(f"Retryable error for {ioc}. Retrying in {wait_time} seconds... (Attempt {attempt + 1}/{MAX_RETRIES})")
                 logger.warning(f"Retryable error for {ioc}. Retrying in {wait_time} seconds. Attempt {attempt + 1}/{MAX_RETRIES}")
@@ -87,16 +239,23 @@ class VirusTotalClient:
         while True:
             if stop_event and stop_event.is_set():
                 return 0, None
-            
-            api_key = API_KEYS[self.api_index]
+
+            # Ensure we are using a key that still has daily quota
+            api_key = self._select_active_key()
             url = f'https://www.virustotal.com/api/v3/{api_path}/{ioc}'
             headers = {
                 "accept": "application/json",
                 "x-apikey": api_key
             }
-        
+
             try:
                 logger.info(f"Checking {ioc_type.upper()}: {ioc}")
+
+                # Track timing for rate limiting
+                now = time.time()
+                self.last_request_times[self.api_index] = now
+                self.last_used_key_index = self.api_index
+
                 response = requests.get(url, headers=headers, timeout=API_TIMEOUT)
                 self.api_request_count += 1
                 
@@ -126,6 +285,7 @@ class VirusTotalClient:
                 # Handle not found case
                 if response.status_code == 404:
                     logger.info(f"IOC not found in VirusTotal: {ioc}")
+                    self._increment_usage(self.api_index)
                     return 404, {
                         "Status": "Not found",
                         "Link": f"https://www.virustotal.com/gui/{gui_path}/{ioc}",
@@ -138,18 +298,24 @@ class VirusTotalClient:
 
                 # Handle successful response
                 if response.status_code == 200:
+                    self._increment_usage(self.api_index)
                     return self._parse_successful_response(response, ioc, ioc_type, gui_path, country_mapping)
                 else:
                     print(f"IOC {ioc} returned status code {response.status_code}")
                     logger.warning(f"IOC {ioc} returned {response.status_code}")
+                    # Count non-timeout, non-network errors against quota
+                    if response.status_code not in [408]:
+                        self._increment_usage(self.api_index)
                     return response.status_code, None
 
             except requests.exceptions.Timeout:
                 logger.error(f"Request timeout for {ioc}")
-                return 408, None  # Request timeout
+                # 408: request timeout, retryable and not counted towards daily quota
+                return 408, None
             except requests.exceptions.RequestException as e:
                 logger.error(f"Network error for {ioc}: {str(e)}")
-                return 400, None
+                # 499: synthetic code for network-level issues, retryable and not counted
+                return 499, None
             except Exception as e:
                 logger.error(f"Unexpected error for {ioc}: {str(e)}")
                 return 500, None
@@ -250,9 +416,30 @@ class VirusTotalClient:
             return 500, None
     
     def apply_rate_limit(self, stop_event=None):
-        """Apply rate limiting delay between requests"""
-        if stop_event is None or not stop_event.is_set():
+        """Apply rate limiting delay between requests.
+
+        Ensures we do not exceed the free API rate of 4 lookups/minute per key
+        while also respecting the configured minimum API_REQUEST_DELAY.
+        """
+        if stop_event is not None and stop_event.is_set():
+            return
+
+        # If we do not yet know which key was used, fall back to simple delay
+        if self.last_used_key_index is None:
             time.sleep(API_REQUEST_DELAY)
+            return
+
+        min_interval = max(60.0 / float(REQUESTS_PER_MINUTE), float(API_REQUEST_DELAY))
+        last_ts = self.last_request_times[self.last_used_key_index] or 0.0
+        if last_ts <= 0:
+            time.sleep(API_REQUEST_DELAY)
+            return
+
+        elapsed = time.time() - last_ts
+        if elapsed < min_interval:
+            sleep_for = min_interval - elapsed
+            if sleep_for > 0 and (stop_event is None or not stop_event.is_set()):
+                time.sleep(sleep_for)
 
 
 def fetch_country_mapping():
