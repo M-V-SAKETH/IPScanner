@@ -67,8 +67,13 @@ class VirusTotalClient:
         """
         today = self._get_today_str()
         default_keys = []
-        for _ in API_KEYS:
-            default_keys.append({"last_reset_date": today, "requests_today": 0})
+        for idx, _ in enumerate(API_KEYS):
+            default_keys.append({
+                "key_index": idx,
+                "label": f"key_{idx + 1}",
+                "last_reset_date": today,
+                "requests_today": 0,
+            })
 
         if not VT_USAGE_FILE:
             return {"keys": default_keys}
@@ -101,6 +106,8 @@ class VirusTotalClient:
             last_reset = entry.get("last_reset_date", today)
             requests_today = entry.get("requests_today", 0)
             keys[i] = {
+                "key_index": i,
+                "label": entry.get("label", f"key_{i + 1}"),
                 "last_reset_date": last_reset,
                 "requests_today": int(requests_today) if isinstance(requests_today, (int, float)) else 0,
             }
