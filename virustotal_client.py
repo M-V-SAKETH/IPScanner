@@ -3,8 +3,6 @@ VirusTotal API Client Module
 Handles all interactions with VirusTotal API
 """
 
-import json
-import os
 import time
 from datetime import datetime, timezone
 
@@ -18,7 +16,6 @@ from config import (
     API_REQUEST_DELAY,
     MAX_RETRIES,
     RETRY_DELAY,
-    VT_USAGE_FILE,
     DAILY_QUOTA_PER_KEY,
     REQUESTS_PER_MINUTE,
 )
@@ -32,8 +29,8 @@ class VirusTotalClient:
         self.api_index = 0
         self.api_request_count = 0
 
-        # Track per-key daily usage loaded from/saved to JSON file
-        self.usage = self._load_usage_state()
+        # Track per-key daily usage in memory only (no JSON file)
+        self.usage = self._init_usage_state()
 
         # Track last request timestamps per key to enforce per-minute rate
         self.last_request_times = [0.0] * len(API_KEYS)
@@ -54,85 +51,27 @@ class VirusTotalClient:
         }
 
     # ------------------------------------------------------------------
-    # Usage / quota tracking helpers
+    # Usage / quota tracking helpers (in-memory only)
     # ------------------------------------------------------------------
 
     def _get_today_str(self):
         return datetime.utcnow().strftime("%Y-%m-%d")
 
-    def _load_usage_state(self):
+    def _init_usage_state(self):
         """
-        Load per-key usage information from JSON file.
-        If the file is missing or corrupted, start with a fresh state.
+        Initialize per-key usage information in memory.
+        This is reset on each run; no JSON file is used.
         """
         today = self._get_today_str()
-        default_keys = []
+        keys = []
         for idx, _ in enumerate(API_KEYS):
-            default_keys.append({
+            keys.append({
                 "key_index": idx,
                 "label": f"key_{idx + 1}",
                 "last_reset_date": today,
                 "requests_today": 0,
             })
-
-        if not VT_USAGE_FILE:
-            return {"keys": default_keys}
-
-        try:
-            if os.path.exists(VT_USAGE_FILE):
-                with open(VT_USAGE_FILE, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-            else:
-                data = {"keys": default_keys}
-        except Exception as e:
-            logger.warning(f"Failed to load VT usage file '{VT_USAGE_FILE}': {e}. Recreating state.")
-            data = {"keys": default_keys}
-
-        # Ensure structure and length match API_KEYS
-        keys = data.get("keys", [])
-        if not isinstance(keys, list):
-            keys = []
-
-        # Resize to match number of API keys
-        if len(keys) < len(API_KEYS):
-            for _ in range(len(API_KEYS) - len(keys)):
-                keys.append({"last_reset_date": today, "requests_today": 0})
-        elif len(keys) > len(API_KEYS):
-            keys = keys[: len(API_KEYS)]
-
-        # Normalize entries
-        for i in range(len(keys)):
-            entry = keys[i] or {}
-            last_reset = entry.get("last_reset_date", today)
-            requests_today = entry.get("requests_today", 0)
-            keys[i] = {
-                "key_index": i,
-                "label": entry.get("label", f"key_{i + 1}"),
-                "last_reset_date": last_reset,
-                "requests_today": int(requests_today) if isinstance(requests_today, (int, float)) else 0,
-            }
-
-        state = {"keys": keys}
-        self._save_usage_state(state)
-        return state
-
-    def _save_usage_state(self, state=None):
-        """Persist usage state to JSON file safely."""
-        if not VT_USAGE_FILE:
-            return
-
-        if state is None:
-            state = self.usage
-
-        try:
-            directory = os.path.dirname(VT_USAGE_FILE)
-            if directory and not os.path.exists(directory):
-                os.makedirs(directory, exist_ok=True)
-
-            with open(VT_USAGE_FILE, "w", encoding="utf-8") as f:
-                json.dump(state, f, indent=2)
-        except Exception as e:
-            logger.warning(f"Failed to save VT usage file '{VT_USAGE_FILE}': {e}")
+        return {"keys": keys}
 
     def _reset_if_new_day(self, key_index):
         """Reset the usage counter for a key if a new day has started."""
@@ -141,7 +80,6 @@ class VirusTotalClient:
         if key_info.get("last_reset_date") != today:
             key_info["last_reset_date"] = today
             key_info["requests_today"] = 0
-            self._save_usage_state()
 
     def _has_quota(self, key_index):
         """Check if the given key has remaining daily quota."""
@@ -150,12 +88,11 @@ class VirusTotalClient:
         return key_info.get("requests_today", 0) < DAILY_QUOTA_PER_KEY
 
     def _increment_usage(self, key_index):
-        """Increment the request counter for a key and persist the state."""
+        """Increment the request counter for a key (in memory only)."""
         try:
             self._reset_if_new_day(key_index)
             key_info = self.usage["keys"][key_index]
             key_info["requests_today"] = int(key_info.get("requests_today", 0)) + 1
-            self._save_usage_state()
         except Exception as e:
             logger.warning(f"Failed to increment VT usage for key {key_index}: {e}")
 
