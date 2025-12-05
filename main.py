@@ -4,7 +4,7 @@ Main Entry Point for IOC Scanner Application
 
 import signal
 from datetime import datetime
-from loggerConfig import logger
+from loggerConfig import logger, cleanup_old_logs
 from config import INPUT_FILE
 from csv_handler import CSVHandler
 from scanner import (
@@ -15,6 +15,9 @@ from scanner import (
 
 def main():
     """Enhanced main function supporting all IOC types"""
+    # Clean up old log files (older than 3 months) at startup
+    cleanup_old_logs()
+    
     # Set up signal handlers
     signal.signal(signal.SIGINT, signal_handler)   # Handle Ctrl+C
     signal.signal(signal.SIGTERM, signal_handler)  # Handle termination signal
